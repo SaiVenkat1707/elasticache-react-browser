@@ -1,0 +1,485 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cache Browser - Application Stack (Template 2)
+  Layers the cache browser tool onto an existing environment (provisioned
+  by env-stack.yaml or equivalent prod resources). Takes all dependencies
+  as parameters so it can be deployed against any compatible environment.
+
+  Adds:
+   * Cognito User Pool Client (custom UI flow, USER_PASSWORD_AUTH enabled)
+   * API Gateway JWT authorizer + 3 routes wired to the Lambda
+   * Read-only ElastiCache IAM user, added to the existing user group
+     via a custom resource (CFN has no native "add member" operation)
+   * Lambda function (Node.js 22, ARM64, in the env VPC)
+   * Lambda security group + ingress rule on the cache's SG
+   * S3 bucket + CloudFront distribution + OAC for the React frontend
+   * CloudWatch log group for the Lambda
+
+  Deploy with `aws cloudformation package` (uploads the local Lambda
+  source to S3 and rewrites the template), then `aws cloudformation deploy`.
+
+# ----------------------------------------------------------------
+# Parameters - everything Template 2 needs from the env. Prod
+# fills these in with their actual existing resource IDs.
+# ----------------------------------------------------------------
+Parameters:
+  AppName:
+    Type: String
+    Default: cache-browser
+    Description: Prefix for application resource names
+
+  # --- VPC / Networking ---
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC the Lambda will be placed into
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet (AZ-a) for the Lambda
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet (AZ-b) for the Lambda
+
+  # --- ElastiCache ---
+  CacheReplicationGroupId:
+    Type: String
+    Description: ElastiCache replication group ID (used for elasticache:Connect ARN)
+
+  CacheConfigurationEndpoint:
+    Type: String
+    Description: Cluster-mode-enabled configuration endpoint hostname
+
+  CachePort:
+    Type: Number
+    Default: 6379
+    Description: Cache port
+
+  CacheSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group attached to the cache cluster
+
+  CacheUserGroupId:
+    Type: String
+    Description: Existing ElastiCache user group ID (the read-only user gets added to this)
+
+  # --- Cognito ---
+  UserPoolId:
+    Type: String
+    Description: Existing Cognito User Pool ID
+
+  UserPoolArn:
+    Type: String
+    Description: Existing Cognito User Pool ARN
+
+  # --- API Gateway ---
+  HttpApiId:
+    Type: String
+    Description: Existing HTTP API ID (routes get added to it)
+
+  HttpApiEndpoint:
+    Type: String
+    Description: Existing HTTP API endpoint URL (passed to the React app)
+
+  # --- Lambda code location (you upload the zip to S3 manually before deploy) ---
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket holding the Lambda zip (use the staging bucket from env stack)
+
+  LambdaCodeKey:
+    Type: String
+    Default: cache-browser.zip
+    Description: S3 key/filename of the Lambda zip in the bucket above
+
+  # --- Scan tuning (per-environment performance knobs) ---
+  ScanBatchSize:
+    Type: Number
+    Default: 1000
+    Description: >
+      SCAN COUNT hint - how many keys each shard examines per iteration.
+      Higher = fewer round-trips (faster scan) but each iteration blocks the
+      shard longer, which can cause latency spikes on a large, busy production
+      cache. Small/idle caches: 5000-6000 is fine. Large busy prod caches:
+      keep moderate (1000-2000) to avoid impacting live traffic.
+
+  MaxKeysPerResponse:
+    Type: Number
+    Default: 500
+    Description: >
+      Hard cap on keys returned/scanned per request. Protects against an
+      accidental full scan of a huge keyspace. On large caches, browse the
+      root sparingly and prefer narrow prefixes; this cap will mark results
+      'truncated' rather than scanning millions of keys.
+
+Resources:
+
+  # ----------------------------------------------------------------
+  # Cognito User Pool Client - custom UI flow
+  # No callback/logout URLs because the React app calls Cognito
+  # directly via the SDK (no Hosted UI redirect).
+  # ----------------------------------------------------------------
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AppName}-client
+      UserPoolId: !Ref UserPoolId
+      GenerateSecret: false  # Public client (browser); secrets cannot be held safely
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH      # Email + password from the React form
+        - ALLOW_REFRESH_TOKEN_AUTH      # Refresh tokens to keep sessions alive
+      PreventUserExistenceErrors: ENABLED   # Don't leak which emails exist
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # ----------------------------------------------------------------
+  # API Gateway JWT Authorizer + 3 routes
+  # ----------------------------------------------------------------
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApiId
+      AuthorizerType: JWT
+      Name: !Sub ${AppName}-jwt-authorizer
+      IdentitySource:
+        - $request.header.Authorization
+      JwtConfiguration:
+        Audience:
+          - !Ref UserPoolClient
+        Issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}
+
+  # Read-only IAM cache user.
+  # +@read    : read commands (GET, SCAN, TYPE, LRANGE, etc.)
+  # +@connection : AUTH, PING, etc.
+  # +cluster +info : REQUIRED for cluster-mode clients to discover the shard
+  #   topology (CLUSTER SLOTS / INFO). These are not writes — they're read-only
+  #   discovery, but they live outside @read so must be granted explicitly.
+  #   Without them, ioredis fails with "Failed to refresh slots cache".
+  ReadOnlyCacheUser:
+    Type: AWS::ElastiCache::User
+    Properties:
+      Engine: valkey
+      UserId: !Sub ${AppName}-readonly
+      UserName: !Sub ${AppName}-readonly
+      AccessString: 'on ~* &* -@all +@read +@connection +cluster +info'
+      AuthenticationMode:
+        Type: iam
+
+  # ----------------------------------------------------------------
+  # Custom resource: add the read-only user to the existing user group.
+  # CFN has no native "user-group membership" resource, so a tiny Lambda
+  # calls ModifyUserGroup on create / delete.
+  # ----------------------------------------------------------------
+  UserGroupModifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ModifyUserGroupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticache:ModifyUserGroup
+                  - elasticache:DescribeUserGroups
+                Resource: '*'
+
+  UserGroupModifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-usergroup-modifier
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt UserGroupModifierRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          ec = boto3.client('elasticache')
+
+          def handler(event, context):
+              try:
+                  props = event['ResourceProperties']
+                  group_id = props['UserGroupId']
+                  user_id  = props['UserId']
+                  action   = event['RequestType']
+
+                  if action == 'Create':
+                      ec.modify_user_group(UserGroupId=group_id, UserIdsToAdd=[user_id])
+                  elif action == 'Delete':
+                      try:
+                          ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[user_id])
+                      except ec.exceptions.UserNotFoundFault:
+                          pass  # already gone; treat delete as success
+                  # Update: assume same user/group; no-op.
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, user_id)
+              except Exception as e:
+                  print(f'Error: {e}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  AddReadOnlyUserToGroup:
+    Type: Custom::UserGroupMembership
+    DependsOn: ReadOnlyCacheUser
+    Properties:
+      ServiceToken: !GetAtt UserGroupModifierFunction.Arn
+      UserGroupId: !Ref CacheUserGroupId
+      UserId: !Ref ReadOnlyCacheUser
+
+  # ----------------------------------------------------------------
+  # Lambda security group + cache SG ingress rule
+  # ----------------------------------------------------------------
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Cache browser Lambda SG (egress only, to cache)
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-lambda-sg
+
+  CacheIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref CacheSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref CachePort
+      ToPort: !Ref CachePort
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: !Sub Allow cache browser Lambda (${AppName}) on Valkey port
+
+  # ----------------------------------------------------------------
+  # Main Lambda (cache browser)
+  # ----------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ElastiCacheConnectPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # elasticache:Connect on cluster + user is the IAM-auth permission.
+              # The Lambda's role identity is what mints the IAM auth token.
+              - Effect: Allow
+                Action: elasticache:Connect
+                Resource:
+                  - !Sub arn:${AWS::Partition}:elasticache:${AWS::Region}:${AWS::AccountId}:replicationgroup:${CacheReplicationGroupId}
+                  - !GetAtt ReadOnlyCacheUser.Arn
+
+  CacheBrowserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AppName}
+      RetentionInDays: 14
+
+  CacheBrowserLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - CacheBrowserLogGroup
+      - AddReadOnlyUserToGroup   # don't start the fn before the user is in the group
+    Properties:
+      FunctionName: !Ref AppName
+      Runtime: nodejs22.x
+      Architectures:
+        - arm64
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      # Code is in an S3 zip you upload manually before deploying this stack
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Environment:
+        Variables:
+          CACHE_HOST: !Ref CacheConfigurationEndpoint
+          CACHE_NAME: !Ref CacheReplicationGroupId
+          CACHE_PORT: !Ref CachePort
+          CACHE_USER: !Sub ${AppName}-readonly
+          CLUSTER_MODE: enabled
+          AWS_REGION_OVERRIDE: !Ref AWS::Region
+          SCAN_BATCH_SIZE: !Ref ScanBatchSize
+          MAX_KEYS_PER_RESPONSE: !Ref MaxKeysPerResponse
+
+  # API Gateway needs explicit permission to invoke the Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CacheBrowserLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApiId}/*/*
+
+  # ----------------------------------------------------------------
+  # API Gateway integrations + routes
+  # ----------------------------------------------------------------
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApiId
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CacheBrowserLambda.Arn
+      PayloadFormatVersion: '2.0'
+      IntegrationMethod: POST
+
+  BrowseRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: GET /browse
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${LambdaIntegration}
+
+  DumpRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: GET /dump
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${LambdaIntegration}
+
+  GetValueRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: GET /getValue
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${LambdaIntegration}
+
+  SearchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: GET /search
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub integrations/${LambdaIntegration}
+
+  # ----------------------------------------------------------------
+  # S3 bucket for the React build output (private, CloudFront-only)
+  # ----------------------------------------------------------------
+  ReactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AppName}-frontend-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # CloudFront Origin Access Control - lets CloudFront read the private bucket
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AppName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100   # US/Europe edge locations only (cheapest)
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt ReactBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''   # Empty because using OAC, not legacy OAI
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+        # SPA routing - rewrite 403/404 to /index.html so React Router works
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  ReactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${ReactBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+# ----------------------------------------------------------------
+# Outputs - the things you/prod actually need after deploy
+# ----------------------------------------------------------------
+Outputs:
+  CloudFrontUrl:
+    Description: HTTPS URL of the cache browser frontend
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+
+  ReactBucketName:
+    Description: Bucket to upload the React build to (use `aws s3 sync dist/ s3://...`)
+    Value: !Ref ReactBucket
+
+  CloudFrontDistributionId:
+    Description: For cache invalidation after frontend re-deploys
+    Value: !Ref CloudFrontDistribution
+
+  ApiBaseUrl:
+    Description: API base URL the React app uses
+    Value: !Ref HttpApiEndpoint
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID (the React app uses this for login)
+    Value: !Ref UserPoolClient
+
+  ReadOnlyCacheUserId:
+    Description: ElastiCache IAM user the Lambda authenticates as
+    Value: !Ref ReadOnlyCacheUser

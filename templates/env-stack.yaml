@@ -1,0 +1,430 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cache Browser - Environment Stack (Template 1)
+  Provisions a generic, project-agnostic environment that mirrors what
+  production already has standing: a VPC, an ElastiCache (Valkey) cluster
+  with IAM auth + pre-existing users, a Cognito User Pool with pre-existing
+  human users, a bare API Gateway HTTP API, and an S3 staging bucket for
+  Lambda code. No project-specific resources are created here.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: cache-browser-env
+    Description: Prefix for all resource names
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR for the VPC
+
+  AdminUserEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Email for the pre-created admin Cognito user
+
+  EngineerUserEmail:
+    Type: String
+    Default: engineer@example.com
+    Description: Email for the pre-created engineer Cognito user
+
+  CacheNodeType:
+    Type: String
+    Default: cache.t4g.micro
+    Description: ElastiCache node type
+
+Resources:
+
+  # ----------------------------------------------------------------
+  # VPC + Networking
+  # ----------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvName}-igw
+
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvName}-public-1
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvName}-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvName}-private-2
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachIgw
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvName}-nat
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvName}-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIgw
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvName}-private-rt
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  # ----------------------------------------------------------------
+  # ElastiCache (Valkey) - cluster, default SG, pre-existing users + group
+  # ----------------------------------------------------------------
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for the env cache
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Default cache SG - allows inbound from VPC CIDR only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          CidrIp: !Ref VpcCidr
+          Description: Allow Redis from anywhere in the VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvName}-cache-sg
+
+  # Pre-existing cache user #1 - represents an admin user already in prod
+  # For IAM auth, UserId MUST equal UserName (ElastiCache constraint).
+  # AccessString uses Redis ACL syntax. "on ~* &* +@all" = enabled, all
+  # keys/channels, all commands.
+  CacheUserAdmin:
+    Type: AWS::ElastiCache::User
+    Properties:
+      Engine: valkey
+      UserId: cacheadmin
+      UserName: cacheadmin
+      AccessString: 'on ~* &* +@all'
+      AuthenticationMode:
+        Type: iam
+
+  # Pre-existing cache user #2 - represents a read/write user already in prod
+  CacheUserReadWrite:
+    Type: AWS::ElastiCache::User
+    Properties:
+      Engine: valkey
+      UserId: cachereadwrite
+      UserName: cachereadwrite
+      AccessString: 'on ~* &* -@all +@read +@write +@connection'
+      AuthenticationMode:
+        Type: iam
+
+  # User group with the two pre-existing IAM-auth users.
+  # Valkey does NOT require a "default" user in the group — when a Valkey
+  # user group is attached to a cluster, that requirement is automatically
+  # disabled. The cluster's built-in default user is turned off.
+  # Template 2 adds its read-only IAM user to this group.
+  CacheUserGroup:
+    Type: AWS::ElastiCache::UserGroup
+    Properties:
+      Engine: valkey
+      UserGroupId: !Sub ${EnvName}-usergroup
+      UserIds:
+        - !Ref CacheUserAdmin
+        - !Ref CacheUserReadWrite
+
+  # Valkey replication group, CLUSTER MODE ENABLED.
+  # 3 shards (node groups), each with 1 primary + 1 replica.
+  # TLS + IAM auth on.
+  #
+  # Cluster-mode-enabled uses NumNodeGroups (shard count) + ReplicasPerNodeGroup
+  # instead of NumCacheClusters. Clients connect to the ConfigurationEndpoint
+  # which exposes all shards for discovery.
+  CacheCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub ${EnvName}-cache
+      ReplicationGroupDescription: Env cache cluster (Valkey, cluster-mode enabled, IAM auth, TLS)
+      Engine: valkey
+      EngineVersion: '7.2'
+      CacheNodeType: !Ref CacheNodeType
+      NumNodeGroups: 3
+      ReplicasPerNodeGroup: 1
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref CacheSecurityGroup
+      TransitEncryptionEnabled: true
+      AtRestEncryptionEnabled: true
+      UserGroupIds:
+        - !Ref CacheUserGroup
+      Port: 6379
+
+  # ----------------------------------------------------------------
+  # Cognito - User Pool with pre-existing human users
+  # NOTE: CloudFormation cannot set a permanent password for security
+  # reasons. Users are created with a temporary password and must change
+  # it on first login via the Hosted UI (which Template 2 sets up).
+  # ----------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${EnvName}-users
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true  # No public sign-up
+        InviteMessageTemplate:
+          EmailSubject: 'Welcome - your temporary cache browser login'
+          EmailMessage: |
+            You have been added to the cache browser tool.
+
+            Username: {username}
+            Temporary password: {####}
+
+            Sign in via the application URL and you will be prompted
+            to set a permanent password.
+
+  AdminUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref AdminUserEmail
+      DesiredDeliveryMediums:
+        - EMAIL
+      UserAttributes:
+        - Name: email
+          Value: !Ref AdminUserEmail
+        - Name: email_verified
+          Value: 'true'
+
+  EngineerUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref EngineerUserEmail
+      DesiredDeliveryMediums:
+        - EMAIL
+      UserAttributes:
+        - Name: email
+          Value: !Ref EngineerUserEmail
+        - Name: email_verified
+          Value: 'true'
+
+  # ----------------------------------------------------------------
+  # API Gateway HTTP API - bare resource, no routes, no authorizer
+  # ----------------------------------------------------------------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${EnvName}-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'  # Tightened by Template 2 (to the CloudFront URL)
+        AllowMethods:
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - authorization
+          - content-type
+
+  HttpApiDefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  # ----------------------------------------------------------------
+  # S3 staging bucket - Template 2 uploads the Lambda zip here
+  # before its Lambda resource references it
+  # ----------------------------------------------------------------
+  LambdaStagingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvName}-lambda-staging-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+# ----------------------------------------------------------------
+# Outputs - everything Template 2 needs to layer onto this env
+# ----------------------------------------------------------------
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub ${EnvName}-VpcId
+
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub ${EnvName}-PrivateSubnet1
+
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub ${EnvName}-PrivateSubnet2
+
+  VpcCidr:
+    Value: !Ref VpcCidr
+    Export:
+      Name: !Sub ${EnvName}-VpcCidr
+
+  CacheClusterId:
+    Value: !Ref CacheCluster
+    Export:
+      Name: !Sub ${EnvName}-CacheClusterId
+
+  CacheConfigurationEndpoint:
+    Value: !GetAtt CacheCluster.ConfigurationEndPoint.Address
+    Export:
+      Name: !Sub ${EnvName}-CacheConfigurationEndpoint
+
+  CachePort:
+    Value: !GetAtt CacheCluster.ConfigurationEndPoint.Port
+    Export:
+      Name: !Sub ${EnvName}-CachePort
+
+  CacheSecurityGroupId:
+    Value: !Ref CacheSecurityGroup
+    Export:
+      Name: !Sub ${EnvName}-CacheSecurityGroupId
+
+  CacheUserGroupId:
+    Value: !Ref CacheUserGroup
+    Export:
+      Name: !Sub ${EnvName}-CacheUserGroupId
+
+  UserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${EnvName}-UserPoolId
+
+  UserPoolArn:
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: !Sub ${EnvName}-UserPoolArn
+
+  HttpApiId:
+    Value: !Ref HttpApi
+    Export:
+      Name: !Sub ${EnvName}-HttpApiId
+
+  HttpApiEndpoint:
+    Value: !GetAtt HttpApi.ApiEndpoint
+    Export:
+      Name: !Sub ${EnvName}-HttpApiEndpoint
+
+  LambdaStagingBucket:
+    Value: !Ref LambdaStagingBucket
+    Export:
+      Name: !Sub ${EnvName}-LambdaStagingBucket

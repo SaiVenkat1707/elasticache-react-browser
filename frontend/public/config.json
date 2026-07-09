@@ -1,0 +1,6 @@
+{
+  "region": "us-east-1",
+  "userPoolId": "REPLACE_WITH_UserPoolId",
+  "userPoolClientId": "REPLACE_WITH_UserPoolClientId",
+  "apiBaseUrl": "REPLACE_WITH_ApiBaseUrl"
+}
